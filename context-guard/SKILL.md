@@ -22,7 +22,14 @@ cd <skill 目录>
 ./install.sh --dry-run    # 先给用户看会改什么
 ./install.sh
 /usr/bin/python3 context_guard.py --doctor    # 自检
+./test.sh                                     # 离线自测（21 项，隔离状态目录）
 ```
+
+**改完脚本要验证时**，按三层测，别跳：
+
+1. `./test.sh` —— 离线，造事件喂给脚本，不碰生产数据
+2. `--doctor` / `--status` —— 跑真实路径和真实状态
+3. 看状态文件的 `records_seen` 是否随工具调用递增 —— **只有这层能证明 hook 真被内核调用了**（逻辑对 ≠ 被调用）
 
 **用户问"我的会话是不是快满了"时**：
 
@@ -74,11 +81,13 @@ cd <skill 目录>
 | `context_guard.py` | 核心脚本（自包含、零依赖、py3.9+） |
 | `context-guard.json` | 阈值配置，改完立即生效 |
 | `install.sh` | 安装器，自动探测 harness + 幂等写配置 + 备份 |
+| `test.sh` | 离线自测台（21 项），隔离状态目录，`--live` 做活性验证 |
 | `README.md` | 完整文档：支持矩阵、通用化边界、踩坑记录、排错 |
 
 ## 硬约束
 
 - **绝不能阻塞会话**：任何异常必须吞掉并返回 `{"continue": true}`
+- **绝不能误报**：空 stdin / 垃圾输入 / transcript 不存在，一律静默。hook 静默失败时会话照常跑，用户不会察觉守卫已经瞎了
 - **绝不能覆盖用户已有的 hook**：安装器只追加（用户可能有自己的 hook，如会话采集）
 - **必须快**：`PostToolUse` 每次工具调用都触发，只读 transcript 尾部 512KB
-- **兼容 macOS 自带 python3 3.9**：不用 3.10+ 语法
+- **兼容 macOS 自带 python3 3.9**：不用 3.10+ 语法；脚本里 `date +%s%N` 这类 GNU 专有写法也不能用（BSD date 会原样输出 `N`，导致算术报错）

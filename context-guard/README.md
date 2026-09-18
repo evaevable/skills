@@ -75,23 +75,66 @@ cd skills/context-guard
 
 ---
 
-## 安装后必做两件事
+## 如何测试
 
-**① 跑一次自检**，确认每家的 transcript 都能被正确解析：
+分三层，**从下往上做**。前两层完全离线，不需要停会话、也不需要等真实压缩真的发生。
+
+### 第 1 层：自测台（离线，21 项）
+
+```bash
+cd context-guard && ./test.sh          # 隔离状态目录，不碰生产数据
+./test.sh --live                       # 额外做活性验证
+./test.sh --harness codex              # 指定 harness（默认自动探测）
+```
+
+原理很简单：**hook 就是一个「读 stdin JSON → 写 stdout JSON」的普通进程**，所以可以直接造事件喂给它，检查输出。
+
+覆盖的断言：
+
+| 组 | 验证什么 |
+|---|---|
+| 1 语法依赖 | 能编译、Python ≥ 3.9 |
+| 2 健壮性 | 空 stdin / 垃圾输入 / 缺字段 / transcript 不存在 —— **全部必须静默且不报错** |
+| 3 判级 | 未越线静默、越预警线提醒、越危险线提醒 |
+| 4 阈值自适应 | 同样 140K，压缩 0 次只算预警、压缩 3 次已构成危险；冷启动回填计数正确 |
+| 5 节流 | 同级别第二次调用必须静默 |
+| 6 压缩事件 | `PreCompact` 精确计数，且不与断崖推断重复计数 |
+| 7 交接注入 | 注入正文、标记 `.consumed.md`、不重复注入 |
+| 8 CLI | `--status` / `--doctor` 可运行 |
+| 9 性能 | 单次耗时中位 < 300ms（含解释器冷启动） |
+
+**第 2 组是最该加的一组**：hook 出错会**静默失败**，会话照常进行，你根本不知道守卫已经瞎了。所以"异常输入必须静默"和"正常越线必须提醒"要一起测。
+
+### 第 2 层：自检（跑真实路径）
 
 ```bash
 /usr/bin/python3 context_guard.py --doctor
 ```
 
-它会逐家报告：配置目录是否找到、能不能定位到 transcript、读出的占用和窗口是多少。
+逐家报告：配置目录是否找到、能否定位 transcript、读出的占用和窗口是多少，并打印各窗口下的阈值表。**这比单测更有价值** —— 像"适配器从 class 改成 dict 后残留 `.root` 属性访问"这类错，只在某条分支触发，静态检查抓不到。
 
-**② 验证 hook 真的被调用了。** 这是唯一可信的验证方式：
+看真实状态：
 
 ```bash
-ls -la ~/.<harness>/hooks-state/     # 记下状态文件的 mtime
-# 然后在会话里发一条消息 / 跑一次工具调用
-ls -la ~/.<harness>/hooks-state/     # mtime 刷新了 = hook 生效
+/usr/bin/python3 context_guard.py --status          # 最近 5 个会话
+/usr/bin/python3 context_guard.py --status <sid>    # 指定会话
 ```
+
+### 第 3 层：活性验证（唯一可信的方式）
+
+前面两层证明的是"逻辑对"，**不能证明 hook 真被内核调用了**。唯一可信的验证是看状态文件有没有被你**没手动触发**的动作改掉：
+
+```bash
+ls -la ~/.<harness>/hooks-state/     # 记下 mtime 和 records_seen
+# 然后在会话里发一条消息 / 跑一次工具调用
+ls -la ~/.<harness>/hooks-state/     # mtime 刷新、计数 +1 = hook 生效
+```
+
+或者 `./test.sh --live` 会直接把各家状态目录的计数和更新时间打出来。
+
+**只看「没报错」是无效验证** —— 脚本出错时通常也是静默的。看计数器增长。
+
+> 实测补充：Claude 系（含 WorkBuddy）**不需要重启、也不需要面板审批**，settings.json 写入后热加载（实测 14:15 写入、14:16 生效）。Codex 需要一次 `/hooks` 信任审批。桌面端文档里"需重启 + `/hooks` 审批"的说法对 Claude 系不适用。
 
 ---
 
@@ -230,7 +273,7 @@ occupancy = input_tokens                          # ❌ 2,500，差 117 倍
 
 ---
 
-## 开发中踩到并修掉的三个真 bug
+## 开发中踩到并修掉的六个真 bug
 
 记在这里是因为**它们会重复发生**。
 
@@ -247,6 +290,92 @@ _USAGE_RE = re.compile(rb"(?<![_A-Za-z])input_tokens['\"]?\s*:\s*(\d+)")
 
 **③ 适配器从 class 改成 dict 后残留属性访问。**
 `.root` 在 dict 上不存在。这类错误只在某条分支上触发，静态检查抓不到 —— 所以 `--doctor` 这种"跑一遍真实路径"的自检比单测更有价值。
+
+**④ `PreCompact` 与断崖推断会双重计数。**
+`PreCompact` 精确 +1 之后，用量回落又会被断崖检测再 +1，压缩次数直接翻倍。修法是设一个「这次已经数过了」的标记，让紧接着的那次断崖检测跳过。
+
+**⑤ 空 stdin 会误触发提醒。**
+`printf '' | script` 竟然触发了越线提醒 —— 因为空输入下解析出的用量是 0，反而落进了某条判断分支。这违反"绝不误报"原则，必须在入口就挡掉。
+
+**⑥ 用紧凑 JSON 字符串做预筛，遇到带空格格式会静默失效。**
+`b'"type":"message"'` 匹配不到 `"type": "message"`（冒号后有空格）。真实 transcript 目前是紧凑格式所以能用，但**不该依赖序列化细节** —— 改成正则容忍空格。这个坑最阴险的地方是：它不会报错，只会让所有统计悄悄变成 0。
+
+---
+
+## 危险状态是怎么判定的
+
+有两级，判定是 `cur >= 阈值` 的简单比较，但**阈值本身不是常数**：
+
+```python
+level = 2 if cur >= danger else (1 if cur >= warn else 0)
+warn, danger = window * ratio_warn, window * ratio_danger   # 比例，非绝对值
+```
+
+所以"危不危险"取决于三个量：
+
+| 量 | 从哪来 | 为什么要这样 |
+|---|---|---|
+| `cur` 当前占用 | 读 transcript 最后一条带 `usage` 的记录 | 用真实值，不估算 |
+| `window` 窗口大小 | Codex 从 `session_meta.context_window` 读真实值；Claude 系用兜底 200K | 实测 Codex 是 **353,400**，写死必错 |
+| `ratio` 比例 | 按 `compact_count` 选档（68/75 → 60/70 → 52/62 → 44/55） | 压缩越多、摘要叠层越多，越要提前 |
+
+**关键点：危险不由 token 数单独决定，而是由「占窗口的比例 × 已压缩次数」共同决定。** 同样 140K，在压缩 0 次的会话里只是预警，在压缩 3 次的会话里已经是危险 —— 因为前者的上下文是原始对话，后者已经经过三道有损转换。
+
+判级只在**级别上升**时提醒一次（`level > last_level and level > 0`），所以一个"压缩周期"内最多打扰你两次。压缩发生后 `last_level` 归零，允许下个周期重新计数。
+
+查看当前处于哪一档：
+
+```bash
+/usr/bin/python3 context_guard.py --status
+# 状态: 危险 —— 已越过危险线 / 预警 —— 越过预警线 / 正常
+```
+
+---
+
+## 交接内容是怎么展示的
+
+交接文件落在工作区里，默认 `.context-guard/handoff/latest.md`（兼容老的 `.workbuddy/handoff/` 和 `.codebuddy/handoff/`）。
+
+**新会话启动时**，`SessionStart` 事件把它读进来，作为 `additionalContext` 注入，然后**重命名**为 `latest.consumed.md`：
+
+```
+会话启动
+   ↓  SessionStart 触发
+扫描 cwd/.context-guard/handoff/latest.md
+   ↓  找到
+整篇读入 → 加上一行抬头 → 注入 additionalContext
+   ↓
+重命名 latest.md → latest.consumed.md   （不删除，随时可回溯）
+   ↓
+同一份文件不会再次注入（第二次 SessionStart 静默）
+```
+
+实际注入的样子：
+
+```
+# 上一会话交接内容（由 context-guard 注入）
+
+# 会话交接 · 2026-09-18 15:52
+
+## 当前任务
+把 context-guard 从 WorkBuddy 单平台改成跨 harness 通用版…
+
+## 已完成
+- 核心脚本 context_guard.py（1138 行，零依赖，py3.9+），适配 4 家
+…
+
+## 已否决的方案（不要重提）
+- 用向量库做记忆检索 —— 索引跟不上活跃代码库
+- 对 Codex 用 Claude 系 token 语义 —— 会把 292,500 读成 2,500
+```
+
+三个设计取舍：
+
+- **用重命名而非删除**做消费标记 —— 注入过什么随时可查，出问题能追溯。
+- **超长截断到 12000 字符**，并在文末标出完整文件路径。交接文件是全量注入的，不加限制会一上来就吃掉大块上下文 —— 那和守卫的目标正好相反。
+- **模板里必须有「已否决的方案」一节**。这是实践里最容易漏、也最致命的一节：不写，新会话会把你已经论证过不可行的方案再提一遍，然后你得重新论证一遍。模板见 `templates/session-handoff.md`。
+
+配套 skill 见 [`session-handoff`](../session-handoff/)，说一句「交接一下」就生成。
 
 ---
 
