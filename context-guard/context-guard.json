@@ -1,0 +1,22 @@
+{
+  "_comment": "context-guard 配置。改完立即生效，无需重启（Claude 系）或重新审批（Codex 仍需一次 /hooks 信任）。",
+  "enabled": true,
+
+  "_comment_window": "上下文窗口。留空则自动探测：Codex 从 transcript 读真实值；Claude 系用兜底 200000。",
+  "contextWindow": null,
+
+  "_comment_ratios": "阈值 = 窗口 × 比例。用比例而非绝对值，换模型/换 harness 自动适配。minCompacts 是压缩次数下限，压缩越多阈值越提前。",
+  "ratios": [
+    { "minCompacts": 0, "warn": 0.68, "danger": 0.75 },
+    { "minCompacts": 1, "warn": 0.60, "danger": 0.70 },
+    { "minCompacts": 2, "warn": 0.52, "danger": 0.62 },
+    { "minCompacts": 3, "warn": 0.44, "danger": 0.55 }
+  ],
+
+  "_comment_abs": "如果想用绝对值覆盖比例（例如照抄首版的 130000/145000），取消下面两行注释。设了它 ratios 失效。",
+  "_warn": null,
+  "_danger": null,
+
+  "_comment_state": "状态目录。留空则放到当前 harness 的配置目录下（如 ~/.workbuddy/hooks-state）。",
+  "stateDir": null
+}

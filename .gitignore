@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.bak-context-guard-*
+*.tmp
+.DS_Store
+hooks-state/
